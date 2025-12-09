@@ -1,0 +1,243 @@
+#This script processes licking microstructure data across six days by extracting the latency to the first lick for each rat, solution, and experimental group. It categorizes animals by treatment and sex, computes group means and SEM, and generates barplots with centered error bars. For each day, the script performs a three-way ANOVA (Treatment × Sex × Solution) followed by Tukey post-hoc tests, saving all statistical outputs. Significant group differences are automatically annotated on the plots with asterisks, and high-resolution figures are exported for analysis or publication.
+# ========================================================================
+# LIBRARIES
+# ========================================================================
+import os
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.formula.api import ols
+import statsmodels.api as sm
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+
+# ========================================================================
+# CONFIGURATION
+# ========================================================================
+folders = [
+    "Licking_Paper_D1",
+    "Licking_Paper_D2",
+    "Licking_Paper",      # D3
+    "Licking_Paper_D4",
+    "Licking_Paper_D5",
+    "Licking_Paper_D6"
+]
+days_labels = ["D1","D2","D3","D4","D5","D6"]
+
+GROUP_ORDER = [
+    "CONTROL FEMALE",
+    "EXPERIMENTAL FEMALE",
+    "CONTROL MALE",
+    "EXPERIMENTAL MALE"
+]
+
+output_folder = Path("Plots_alldays")
+output_folder.mkdir(exist_ok=True)
+
+# Group identification
+group_patterns = {
+    "CONTROL FEMALE": "CONTROL_F",
+    "EXPERIMENTAL FEMALE": "EXPERIMENTAL_F",
+    "CONTROL MALE": "CONTROL_M",
+    "EXPERIMENTAL MALE": "EXPERIMENTAL_M"
+}
+
+def identify_group(filename_stem):
+    for group_name, pattern in group_patterns.items():
+        if pattern in filename_stem:
+            return group_name
+    return "UNKNOWN"
+
+# Split group into Treatment and Sex for ANOVA
+def split_group(df):
+    df["Treatment"] = df["Group"].apply(lambda x: "Control" if "CONTROL" in x else "Experimental")
+    df["Sex"] = df["Group"].apply(lambda x: "Female" if "FEMALE" in x else "Male")
+    return df
+
+# ========================================================================
+# SOLUTION MAPS PER DAY
+# ========================================================================
+day_solution_map_list = [
+    {1: "Water", 2: "Water2"},      # D1
+    {1: "Sugar", 2: "Sugar2"},      # D2
+    {1: "Water", 2: "Sugar"},       # D3
+    {1: "Sugar", 2: "Water"},       # D4
+    {1: "Fructose", 2: "Sugar"},    # D5
+    {1: "Sugar", 2: "Saccharin"}    # D6
+]
+
+all_possible_solutions = [
+    "Water","Water2","Sugar","Sugar2",
+    "Fructose","Fructose2",
+    "Saccharin","Saccharin2"
+]
+
+# Colors
+solution_palette = {
+    'Water': "#1B3C9B",
+    'Water2': "#00A8CC",
+    'Sugar': "#E6399B",
+    'Sugar2': "#F48CBF",
+    'Fructose': "#B57EDC",
+    'Fructose2': "#4B0082",
+    'Saccharin': "#76C203",
+    'Saccharin2': "#23510D"
+}
+
+# ========================================================================
+# LOAD CSV FUNCTION
+# ========================================================================
+def load_day_csv(path, sol_map):
+    df = pd.read_csv(path, skiprows=17)
+
+    df = df.rename(columns={
+        df.columns[0]: "Time",
+        df.columns[1]: sol_map[1],
+        df.columns[2]: sol_map[2]
+    })
+
+    for sol in all_possible_solutions:
+        if sol not in df.columns:
+            df[sol] = 0
+
+    df[all_possible_solutions] = df[all_possible_solutions].fillna(0)
+    df["Time_sec"] = pd.to_timedelta(df["Time"]).dt.total_seconds()
+    return df
+
+# ========================================================================
+# EXTRACT FIRST BOUTS
+# ========================================================================
+all_first_bouts = []
+
+for folder, day_label, sol_map in zip(folders, days_labels, day_solution_map_list):
+    for file in os.listdir(folder):
+        if not file.endswith(".csv"):
+            continue
+
+        path = os.path.join(folder, file)
+        df = load_day_csv(path, sol_map)
+        rat = Path(file).stem
+        group = identify_group(rat)
+
+        for sol in sol_map.values():
+            first = df.loc[df[sol] > 0, "Time_sec"].min()
+            if pd.notna(first):
+                all_first_bouts.append({
+                    "Rat": rat,
+                    "Group": group,
+                    "Day": day_label,
+                    "Solution": sol,
+                    "FirstBout_sec": first
+                })
+
+df_first_bouts = pd.DataFrame(all_first_bouts)
+df_first_bouts = split_group(df_first_bouts)
+df_first_bouts.to_csv("First_Bouts_All_Days_With_Groups.csv", index=False)
+
+# ========================================================================
+# FUNCTIONS FOR ASTERISKS
+# ========================================================================
+def significance_symbol(p):
+    if p < 0.001: return "***"
+    if p < 0.01: return "**"
+    if p < 0.05: return "*"
+    return ""
+
+def add_sig_line(ax, x1, x2, y, h, text, color="black"):
+    ax.plot([x1, x1, x2, x2], [y, y+h, y+h, y], color=color, linewidth=1)
+    ax.text((x1+x2)/2, y+h, text, ha="center", va="bottom", fontsize=12, color=color)
+
+# ========================================================================
+# MAIN PLOTS
+# ========================================================================
+sns.set(style="whitegrid")
+fig, axes = plt.subplots(1, 6, figsize=(36, 6), sharey=True)
+
+for ax, day_label in zip(axes, days_labels):
+
+    df_day = df_first_bouts[df_first_bouts["Day"] == day_label].copy()
+    df_day["Group"] = pd.Categorical(df_day["Group"], categories=GROUP_ORDER, ordered=True)
+
+    # --------------------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------------------
+    summary = (
+        df_day
+        .groupby(["Group","Solution"], observed=False)["FirstBout_sec"]
+        .agg(["mean","sem"])
+        .reset_index()
+    )
+
+    # --------------------------------------------------------------------
+    # BARPLOT
+    # --------------------------------------------------------------------
+    sns.barplot(
+        data=summary,
+        x="Group", y="mean",
+        hue="Solution",
+        palette=solution_palette,
+        ax=ax,
+        errorbar=None
+    )
+
+    # --------------------------------------------------------------------
+    # SEM ON CENTERED HUE BARS
+    # --------------------------------------------------------------------
+    bars = ax.patches
+    bar_index = 0
+    for idx, row in summary.iterrows():
+        bar = bars[bar_index]
+        x_center = bar.get_x() + bar.get_width()/2
+        y_height = bar.get_height()
+        ax.errorbar(
+            x_center,
+            y_height,
+            row["sem"],
+            fmt="none",
+            ecolor="black",
+            capsize=5,
+            linewidth=1.2,
+            zorder=10
+        )
+        bar_index += 1
+
+    ax.set_title(day_label)
+    ax.set_xlabel("")
+    ax.set_ylabel("Time to First Lick (s)" if ax == axes[0] else "")
+    ax.tick_params(axis='x', rotation=20)
+    y_max = summary["mean"].max()
+    ax.set_ylim(0, 450)
+
+    # ====================================================================
+    # 3-WAY ANOVA: Treatment × Sex × Solution
+    # ====================================================================
+    try:
+        model = ols("FirstBout_sec ~ C(Treatment) * C(Sex) * C(Solution)", data=df_day).fit()
+        anova = sm.stats.anova_lm(model, typ=2)
+        anova.to_csv(f"ANOVA_3way_{day_label}.csv")
+
+        # Tukey HSD (on Group for illustration)
+        tukey = pairwise_tukeyhsd(df_day["FirstBout_sec"], df_day["Group"])
+        tukey_df = pd.DataFrame(tukey.summary().data[1:], columns=tukey.summary().data[0])
+        tukey_df.to_csv(f"Tukey_3way_{day_label}.csv", index=False)
+
+        # Draw asterisks for significant pairs
+        for _, r in tukey_df.iterrows():
+            p = float(r["p-adj"])
+            if p < 0.05:
+                s = significance_symbol(p)
+                g1 = r["group1"]
+                g2 = r["group2"]
+                x1 = GROUP_ORDER.index(g1)
+                x2 = GROUP_ORDER.index(g2)
+                add_sig_line(ax, x1, x2, y_max*1.1, y_max*0.05, s, color="black")
+
+    except Exception as e:
+        print("3-way ANOVA error:", e)
+
+axes[0].legend(loc='upper right')
+plt.tight_layout()
+plt.savefig("Barplot_All_Days_Groups.png", dpi=300)
+plt.savefig("Barplot_All_Days_Groups.svg", dpi=300)
+plt.show()
