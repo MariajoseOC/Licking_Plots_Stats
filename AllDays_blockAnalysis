@@ -1,0 +1,285 @@
+# ============================================================
+# FINAL MERGED 6-PANEL BURST FIGURE
+# Color code from Script A + Structure/Legend/Titles from Script B
+# ============================================================
+
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
+block_duration = 480
+burst_threshold_line = 30
+ymax = 40
+
+# COLORS (Script A)
+liquid_palette = {
+    'Sugar':      "#E6399B",
+    'Sugar2':     "#F48CBF",
+    'Water':      "#1B3C9B",
+    'Water2':     "#00A8CC",
+    'Fructose2':  "#4B0082",
+    'Fructose':   "#B57EDC",
+    'Saccharin2': "#23510D",
+    'Saccharin':  "#76C203"
+}
+
+# SEX AND CONDITION FORMATS (Script A)
+sex_markers = {'FEMALE': 'o', 'MALE': 's'}         # ○ for F, □ for M
+condition_linestyle = {'CONTROL': "-", 'EXPERIMENTAL': "--"}
+
+# GROUPS — Option 1 (Script A style)
+group_patterns = {
+    "CONTROL FEMALE": "_CONTROL_F",
+    "EXPERIMENTAL FEMALE": "_EXPERIMENTAL_F",
+    "CONTROL MALE": "_CONTROL_M",
+    "EXPERIMENTAL MALE": "_EXPERIMENTAL_M"
+}
+
+# DAY-TO-SOLUTION MAP
+day_solution_map_list = [
+    {1: "Water",     2: "Water2"},       # D1
+    {1: "Sugar",     2: "Sugar2"},       # D2
+    {1: "Water",     2: "Sugar"},        # D3
+    {1: "Sugar",     2: "Water"},        # D4
+    {1: "Fructose",  2: "Sugar"},        # D5
+    {1: "Sugar",     2: "Saccharin"}     # D6
+]
+
+folders = [
+    "Licking_Paper_D1",
+    "Licking_Paper_D2",
+    "Licking_Paper",
+    "Licking_Paper_D4",
+    "Licking_Paper_D5",
+    "Licking_Paper_D6"
+]
+
+day_labels = ["D1", "D2", "D3", "D4", "D5", "D6"]
+panel_letters = ["A", "B", "C", "D", "E", "F"]
+title_colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
+
+# ------------------------------------------------------------
+# CSV LOADER
+# ------------------------------------------------------------
+def cargar_csvs_por_grupo(folder, pattern, group_name):
+    dfs = []
+    if not os.path.isdir(folder):
+        return pd.DataFrame()
+
+    for file in os.listdir(folder):
+        if file.endswith(".csv") and pattern in file:
+            path = os.path.join(folder, file)
+            try:
+                df = pd.read_csv(path, skiprows=19)
+            except:
+                continue
+
+            if df.shape[1] >= 3:
+                cols = df.columns[:3]
+                df = df.rename(columns={cols[0]: "Time", cols[1]: "Fructose_Licks", cols[2]: "Sugar_Licks"})
+            else:
+                df.columns = ["Time", "Fructose_Licks", "Sugar_Licks"]
+
+            df["Time_sec"] = pd.to_timedelta(df["Time"]).dt.total_seconds()
+            df["Grupo"] = group_name
+            df["Archivo"] = Path(file).stem
+            dfs.append(df)
+
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+# ------------------------------------------------------------
+# BURST DETECTION
+# ------------------------------------------------------------
+def detect_bursts(lick_times, threshold=0.5):
+    if len(lick_times) < 2:
+        return 0
+    ibi = np.diff(np.sort(lick_times))
+    count = 1
+    for interval in ibi:
+        if interval > threshold:
+            count += 1
+    return count
+
+
+# ------------------------------------------------------------
+# PRE-COMPUTE ALL DAYS (for global max block)
+# ------------------------------------------------------------
+all_stats_per_day = []
+global_max_block = 0
+
+for folder, sol_map in zip(folders, day_solution_map_list):
+
+    burst_blocks = []
+
+    for group_name, pattern in group_patterns.items():
+        df = cargar_csvs_por_grupo(folder, pattern, group_name)
+        if df.empty:
+            continue
+
+        for archivo in df["Archivo"].unique():
+            sub = df[df["Archivo"] == archivo]
+
+            max_time = sub["Time_sec"].max()
+            n_blocks = int(np.ceil(max_time / block_duration))
+
+            for block in range(n_blocks):
+                start = block * block_duration
+                end = (block + 1) * block_duration
+                block_df = sub[(sub["Time_sec"] >= start) & (sub["Time_sec"] < end)]
+
+                b1 = detect_bursts(block_df[block_df["Fructose_Licks"] > 0]["Time_sec"].values)
+                b2 = detect_bursts(block_df[block_df["Sugar_Licks"] > 0]["Time_sec"].values)
+
+                burst_blocks.append({
+                    "Grupo": group_name,
+                    "Archivo": archivo,
+                    "Block": block + 1,
+                    "L1": b1,
+                    "L2": b2
+                })
+
+    if not burst_blocks:
+        all_stats_per_day.append(pd.DataFrame())
+        continue
+
+    df_day = pd.DataFrame(burst_blocks)
+    day_max = df_day["Block"].max()
+
+    global_max_block = max(global_max_block, day_max)
+    all_stats_per_day.append(df_day)
+
+
+if global_max_block == 0:
+    global_max_block = 1
+
+
+# ------------------------------------------------------------
+# PLOTTING
+# ------------------------------------------------------------
+sns.set_style("white")
+fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+axes = axes.flatten()
+
+# Make legend handles
+import matplotlib.lines as mlines
+
+legend_handles = {}
+
+for dmap in day_solution_map_list:
+    for ch in (1, 2):
+        sol = dmap[ch]
+        if sol not in legend_handles:
+            legend_handles[sol] = mlines.Line2D([], [], color=liquid_palette[sol], linewidth=3, label=sol)
+
+legend_handles["FEMALE"] = mlines.Line2D([], [], color="black", marker="o", linestyle="None", label="Female (marker)")
+legend_handles["MALE"] = mlines.Line2D([], [], color="black", marker="s", linestyle="None", label="Male (marker)")
+legend_handles["CONTROL"] = mlines.Line2D([], [], color="black", linestyle="-", label="Control (line)")
+legend_handles["EXPERIMENTAL"] = mlines.Line2D([], [], color="black", linestyle="--", label="Experimental (line)")
+
+
+# ------------------------------------------------------------
+# PANEL LOOP
+# ------------------------------------------------------------
+for idx, (folder, sol_map) in enumerate(zip(folders, day_solution_map_list)):
+
+    ax = axes[idx]
+    panel = panel_letters[idx]
+    df_day = all_stats_per_day[idx]
+
+    if df_day.empty:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax.set_axis_off()
+        continue
+
+    # Label sex/condition
+    df_day["Sex"] = df_day["Grupo"].apply(lambda x: "FEMALE" if "FEMALE" in x else "MALE")
+    df_day["Condition"] = df_day["Grupo"].apply(lambda x: "CONTROL" if "CONTROL" in x else "EXPERIMENTAL")
+
+    stats = df_day.groupby(["Sex", "Condition", "Block"])[["L1", "L2"]].mean().reset_index()
+
+    # Plot L1 and L2
+    for sex in ["FEMALE", "MALE"]:
+        for cond in ["CONTROL", "EXPERIMENTAL"]:
+
+            sub = stats[(stats["Sex"] == sex) & (stats["Condition"] == cond)]
+            if sub.empty:
+                continue
+
+            # L2 (ch2)
+            ax.plot(
+                sub["Block"], sub["L2"],
+                linestyle=condition_linestyle[cond],
+                color=liquid_palette[sol_map[2]],
+                marker=sex_markers[sex], markersize=6,
+                markerfacecolor="white" if sex == "FEMALE" else liquid_palette[sol_map[2]],
+                markeredgecolor=liquid_palette[sol_map[2]],
+                linewidth=2.2
+            )
+
+            # L1 (ch1)
+            ax.plot(
+                sub["Block"], sub["L1"],
+                linestyle=condition_linestyle[cond],
+                color=liquid_palette[sol_map[1]],
+                marker=sex_markers[sex], markersize=6,
+                markerfacecolor="white" if sex == "FEMALE" else liquid_palette[sol_map[1]],
+                markeredgecolor=liquid_palette[sol_map[1]],
+                linewidth=2.2
+            )
+
+    # Axes formatting
+    ax.set_ylim(0, ymax)
+    ax.set_xticks(range(1, global_max_block + 1))
+    ax.set_xlim(0.8, global_max_block + 0.2)
+    ax.set_yticks([0, 10, 20, 30, 40])
+    ax.set_xlabel("Block (8 min)")
+    ax.set_ylabel("Average Bursts")
+
+    # Title and subtitle
+    ax.set_title(f"{day_labels[idx]}: {sol_map[1]} vs {sol_map[2]}",
+                 fontsize=12, weight="bold", color=title_colors[idx])
+
+    present_F = any("FEMALE" in g for g in df_day["Grupo"])
+    present_M = any("MALE" in g for g in df_day["Grupo"])
+    ax.text(0.02, 0.86,
+            f"Females: {'✓' if present_F else '—'}    Males: {'✓' if present_M else '—'}",
+            transform=ax.transAxes, fontsize=9)
+
+    # Threshold line
+    ax.axhline(burst_threshold_line, color="gray", linestyle=":", linewidth=1)
+
+    # Panel letter
+    ax.text(0.02, 0.92, panel, transform=ax.transAxes,
+            fontsize=16, fontweight="bold")
+
+
+    sns.despine(ax=ax, offset=3, trim=True)
+    ax.grid(alpha=0.12, linewidth=0.6)
+
+
+# ------------------------------------------------------------
+# GLOBAL LEGEND
+# ------------------------------------------------------------
+fig.legend(
+    list(legend_handles.values()),
+    list(legend_handles.keys()),
+    loc="lower center",
+    ncol=4,
+    frameon=False,
+    fontsize=9,
+    bbox_to_anchor=(0.5, -0.02)
+)
+
+plt.tight_layout(rect=[0, 0.04, 1, 1])
+
+plt.savefig("BURST_6PANEL_FIGURE_FINAL.svg", dpi=600)
+plt.savefig("BURST_6PANEL_FIGURE_FINAL.png", dpi=600)
+
+plt.show()
