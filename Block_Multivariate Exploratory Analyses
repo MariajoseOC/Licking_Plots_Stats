@@ -1,0 +1,757 @@
+import os
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.cross_decomposition import CCA
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.regression.mixed_linear_model import MixedLM
+from statsmodels.multivariate.manova import MANOVA
+
+# ============================
+# SETTINGS
+# ============================
+CSV_SKIPROWS = 17  # ajusta si tus CSV tienen diferente cabecera
+folders = [
+    "Licking_Paper_D1",
+    "Licking_Paper_D2",
+    "Licking_Paper",      # D3
+    "Licking_Paper_D4",
+    "Licking_Paper_D5",
+    "Licking_Paper_D6",
+]
+days_labels = ["D1", "D2", "D3", "D4", "D5", "D6"]
+
+output_folder = Path("analysis_output")
+output_folder.mkdir(exist_ok=True)
+(output_folder / "figs").mkdir(exist_ok=True)
+(output_folder / "tables").mkdir(exist_ok=True)
+
+# map of solutions per day (user-provided)
+day_solution_map_list = [
+    {1: "Water",     2: "Water2"},       # D1
+    {1: "Sugar",     2: "Sugar2"},       # D2
+    {1: "Water",     2: "Sugar"},        # D3
+    {1: "Sugar",     2: "Water"},        # D4
+    {1: "Fructose",  2: "Sugar"},        # D5
+    {1: "Sugar",     2: "Saccharin"}     # D6
+]
+
+# group patterns (must match Path.stem)
+group_patterns = {
+    "Control Female": "CONTROL_F",
+    "Experimental Female": "EXPERIMENTAL_F",
+    "Control Male": "CONTROL_M",
+    "Experimental Male": "EXPERIMENTAL_M",
+}
+
+# palettes
+palette_science = {
+    "Water":     "#4A90E2",
+    "Sugar":     "#F28CAB",
+    "Fructose":  "#7BA05B",
+    "Saccharin": "#F5C542"
+}
+palette_treatment = {
+    "Control":      "#4C566A",
+    "Experimental": "#9B59B6"
+}
+palette_sex = {
+    "M": "#1B9E77",
+    "F": "#D95F02"
+}
+group_colors = {
+    "Control Female": "#6baed6",
+    "Experimental Female": "#de77a6",
+    "Control Male": "#74c476",
+    "Experimental Male": "#9e9ac8",
+}
+
+# block / burst settings
+BLOCK_SIZE = 480  # 8 minutes
+ILI_within = 0.25
+ILI_between = 0.5
+
+# helper: normalize names (Saccharin vs Saccharine)
+def normalize_solution_name(name):
+    if pd.isna(name):
+        return name
+    nm = str(name).strip()
+    if nm.lower() in ["saccharine", "saccharin"]:
+        return "Saccharin"
+    return nm
+
+def infer_group_from_filename(stem):
+    for k, v in group_patterns.items():
+        if v in stem:
+            return k
+    return "Unknown"
+
+# ============================
+# FILE LOADING & SOLUTION NAMING
+# ============================
+def assign_solutions_by_day_columns(df, day_label):
+    """Rename the two lick columns to the solution names for that day,
+       and create numeric Licks_<Solution> columns to avoid mixing text columns."""
+    # day_label like "D1" -> index 0
+    day_index = int(day_label.replace("D", "")) - 1
+    mapping = day_solution_map_list[day_index]
+    s1_name = normalize_solution_name(mapping[1])
+    s2_name = normalize_solution_name(mapping[2])
+
+    # original numeric columns expected at positions 1 and 2 (after Time)
+    raw_cols = list(df.columns)
+    if len(raw_cols) < 3:
+        raise ValueError("CSV doesn't have at least three columns (Time, col1, col2).")
+    col_time = raw_cols[0]
+    col_raw1 = raw_cols[1]
+    col_raw2 = raw_cols[2]
+
+    # create numeric columns Licks_<name>
+    l1 = f"Licks_{s1_name}"
+    l2 = f"Licks_{s2_name}"
+
+    # convert source columns to numeric safely
+    df[col_raw1] = pd.to_numeric(df[col_raw1], errors="coerce").fillna(0).astype(float)
+    df[col_raw2] = pd.to_numeric(df[col_raw2], errors="coerce").fillna(0).astype(float)
+
+    # assign Licks_<name> cols
+    # if name duplicates (e.g., Water2) still create distinct column
+    # ensure no accidental overwriting of Time or metadata
+    df[l1] = df[col_raw1].astype(float)
+    df[l2] = df[col_raw2].astype(float)
+
+    # keep original short names for backward compatibility
+    df["Solution1"] = df[col_raw1].astype(float)
+    df["Solution2"] = df[col_raw2].astype(float)
+
+    # save labels
+    df["Solution1_Label"] = s1_name
+    df["Solution2_Label"] = s2_name
+
+    return df
+
+def load_file(path, day_label):
+    # read CSV
+    df = pd.read_csv(path, skiprows=CSV_SKIPROWS)
+    # rename first col to Time to standardize
+    df = df.rename(columns={df.columns[0]: "Time"})
+    # try to parse Time to seconds (if already numeric keep)
+    try:
+        df["Time_sec"] = pd.to_numeric(df["Time"], errors="coerce")
+        if df["Time_sec"].isna().all():
+            # try parse datetime-like
+            df["Time_sec"] = pd.to_timedelta(df["Time"]).dt.total_seconds()
+    except Exception:
+        df["Time_sec"] = pd.to_timedelta(df["Time"]).dt.total_seconds()
+
+    # assign solution-named lick columns and safe numeric copies
+    df = assign_solutions_by_day_columns(df, day_label)
+
+    # metadata from filename
+    stem = Path(path).stem
+    df["Group"] = infer_group_from_filename(stem)
+    df["Archivo"] = stem
+    df["Day"] = day_label
+    # sexo inferral: prefer group name
+    if "Male" in df["Group"].iloc[0] or "_M" in stem or "M_" in stem:
+        df["Sexo"] = "M"
+    elif "Female" in df["Group"].iloc[0] or "_F" in stem or "F_" in stem:
+        df["Sexo"] = "F"
+    else:
+        df["Sexo"] = "F"  # fallback
+
+    df["Tratamiento"] = "Experimental" if "EXPERIMENTAL" in stem else "Control"
+    return df
+
+def split_blocks(df):
+    df = df.copy()
+    df["Bloque"] = (df["Time_sec"] // BLOCK_SIZE).astype(int)
+    return df
+
+# ============================
+# METRICS: file-level & block-level
+# ============================
+def get_lick_cols(df):
+    """Return the list of numeric lick columns created Licks_<name> in dataframe order."""
+    lick_cols = [c for c in df.columns if str(c).startswith("Licks_")]
+    return lick_cols
+
+def compute_file_level_metrics(df):
+    results = {}
+    results["Archivo"] = df["Archivo"].iloc[0]
+    results["Group"] = df["Group"].iloc[0]
+    results["Day"] = df["Day"].iloc[0]
+    results["Sexo"] = df["Sexo"].iloc[0]
+    results["Tratamiento"] = df["Tratamiento"].iloc[0]
+
+    # Use the Licks_* columns for totals (robust to names changing)
+    lick_cols = get_lick_cols(df)
+    # Sum total per file
+    s_by_solution = {col: df[col].sum() for col in lick_cols}
+    for k, v in s_by_solution.items():
+        results[k] = v
+    total = sum(s_by_solution.values()) if s_by_solution else 0.0
+    results["Total_Licks"] = total
+
+    # Duration and lick rate
+    duration = df["Time_sec"].max() - df["Time_sec"].min()
+    results["Duration_s"] = duration if pd.notna(duration) else np.nan
+    results["Lick_Rate"] = total / duration if duration and duration > 0 else np.nan
+
+    # ILI and bursts using times when any Licks_* > 0
+    if lick_cols:
+        lick_mask = df[lick_cols].sum(axis=1) > 0
+    else:
+        lick_mask = df.iloc[:, 1:].sum(axis=1) > 0  # fallback, but should not happen
+
+    lick_times = df.loc[lick_mask, "Time_sec"].values
+    if len(lick_times) > 1:
+        ilis = np.diff(lick_times)
+        results["ILI_mean"] = np.mean(ilis)
+        results["ILI_median"] = np.median(ilis)
+        results["ILI_std"] = np.std(ilis)
+
+        # bursts segmentation
+        bursts = []
+        current = [lick_times[0]]
+        for i, dt in enumerate(ilis):
+            if dt <= ILI_within:
+                current.append(lick_times[i+1])
+            else:
+                bursts.append(current)
+                current = [lick_times[i+1]]
+        if current:
+            bursts.append(current)
+
+        burst_sizes = [len(b) for b in bursts] if bursts else []
+        results["Burst_Count"] = len(bursts)
+        results["Burst_Rate_per_min"] = (len(bursts) / (duration/60)) if duration and duration > 0 else np.nan
+        results["Burst_Size_mean"] = np.mean(burst_sizes) if burst_sizes else np.nan
+        results["Burst_Size_max"] = np.max(burst_sizes) if burst_sizes else np.nan
+    else:
+        results.update({
+            "ILI_mean": np.nan, "ILI_median": np.nan, "ILI_std": np.nan,
+            "Burst_Count": 0, "Burst_Rate_per_min": 0, "Burst_Size_mean": np.nan, "Burst_Size_max": np.nan
+        })
+
+    return results
+
+def compute_block_level_metrics(df):
+    rows = []
+    lick_cols = get_lick_cols(df)
+    for (archivo, bloque), sub in df.groupby(["Archivo", "Bloque"]):
+        row = {}
+        row["Archivo"] = archivo
+        row["Bloque"] = int(bloque)
+        row["Group"] = sub["Group"].iloc[0]
+        row["Day"] = sub["Day"].iloc[0]
+        row["Sexo"] = sub["Sexo"].iloc[0]
+        row["Tratamiento"] = sub["Tratamiento"].iloc[0]
+
+        # totals per block
+        s_by_solution = {col: sub[col].sum() for col in lick_cols}
+        for k, v in s_by_solution.items():
+            row[k] = v
+        total = sum(s_by_solution.values()) if s_by_solution else 0.0
+        row["Total_Licks"] = total
+
+        # duration and rate
+        duration = sub["Time_sec"].max() - sub["Time_sec"].min() if len(sub) > 1 else np.nan
+        row["Duration_s"] = duration
+        row["Lick_Rate"] = total / duration if duration and duration > 0 else np.nan
+
+        # ILI and bursts per block
+        if lick_cols:
+            lick_mask = sub[lick_cols].sum(axis=1) > 0
+        else:
+            lick_mask = sub.iloc[:, 1:].sum(axis=1) > 0
+
+        lick_times = sub.loc[lick_mask, "Time_sec"].values
+        if len(lick_times) > 1:
+            ilis = np.diff(lick_times)
+            row["ILI_mean"] = np.mean(ilis)
+            row["ILI_median"] = np.median(ilis)
+            row["ILI_std"] = np.std(ilis)
+
+            bursts = []
+            current = [lick_times[0]]
+            for i, dt in enumerate(ilis):
+                if dt <= ILI_within:
+                    current.append(lick_times[i+1])
+                else:
+                    bursts.append(current)
+                    current = [lick_times[i+1]]
+            if current:
+                bursts.append(current)
+
+            sizes = [len(b) for b in bursts]
+            row["Burst_Count"] = len(bursts)
+            row["Burst_Rate_per_min"] = (len(bursts) / (duration/60)) if duration and duration > 0 else np.nan
+            row["Burst_Size_mean"] = np.mean(sizes) if sizes else np.nan
+            row["Burst_Size_max"] = np.max(sizes) if sizes else np.nan
+        else:
+            row.update({"ILI_mean": np.nan, "ILI_median": np.nan, "ILI_std": np.nan,
+                        "Burst_Count": 0, "Burst_Rate_per_min": 0, "Burst_Size_mean": np.nan,
+                        "Burst_Size_max": np.nan})
+
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+# ============================
+# MAIN: load files, compute metrics
+# ============================
+print("Cargando archivos...")
+all_files = []
+for folder, day_label in zip(folders, days_labels):
+    p = Path(folder)
+    if not p.exists():
+        print(f"⚠️ Carpeta no encontrada: {p} — omitiendo")
+        continue
+    for f in p.glob("*.csv"):
+        all_files.append((f, day_label))
+
+if not all_files:
+    raise FileNotFoundError("No se encontraron archivos CSV en las carpetas especificadas.")
+
+raw_dfs = []
+for f, day_label in all_files:
+    df = load_file(f, day_label)
+    df = split_blocks(df)
+    raw_dfs.append(df)
+
+full_df = pd.concat(raw_dfs, ignore_index=True)
+print(f"Archivos cargados: {full_df['Archivo'].nunique()} archivos, {len(full_df)} filas total")
+
+# file-level summaries
+file_summaries = []
+for archivo, sub in full_df.groupby("Archivo"):
+    file_summaries.append(compute_file_level_metrics(sub))
+file_summary_df = pd.DataFrame(file_summaries)
+file_summary_df.to_csv(output_folder / "tables" / "file_summary_metrics.csv", index=False)
+print("File-level metrics saved.")
+
+# block-level summaries
+block_df = compute_block_level_metrics(full_df)
+block_df.to_csv(output_folder / "tables" / "block_level_metrics.csv", index=False)
+print("Block-level metrics saved.")
+
+# ============================
+# ANALYSIS A: MANOVA + ANOVAs on file totals (multivariate + univariate)
+# ============================
+print("Running MANOVA and ANOVAs on file-level totals...")
+# ensure we have columns Solution-like for MANOVA: use any Licks_ columns + Total_Licks
+mv_cols = [c for c in file_summary_df.columns if str(c).startswith("Licks_")]
+# create formula string: Licks_a + Licks_b + Total_Licks ~ Sexo * Tratamiento * Day
+mv_lhs = " + ".join(mv_cols + ["Total_Licks"]) if mv_cols else "Total_Licks"
+mv_formula = f"{mv_lhs} ~ Sexo * Tratamiento * Day"
+try:
+    man = MANOVA.from_formula(mv_formula, data=file_summary_df)
+    manova_res = man.mv_test()
+    with open(output_folder / "tables" / "MANOVA_totals.txt", "w") as fh:
+        fh.write(str(manova_res))
+    print("MANOVA saved.")
+except Exception as e:
+    print("MANOVA failed:", e)
+
+# univariate ANOVAs for Total_Licks and each Licks_ column
+for dv in (["Total_Licks"] + mv_cols):
+    try:
+        model = ols(f"{dv} ~ C(Sexo) * C(Tratamiento) * C(Day)", data=file_summary_df).fit()
+        anova_table = sm.stats.anova_lm(model, typ=2)
+        anova_table.to_csv(output_folder / "tables" / f"ANOVA_filelevel_{dv}.csv")
+    except Exception as e:
+        print(f"ANOVA failed for {dv}: {e}")
+
+# ============================
+# ANALYSIS B: Mixed models & ANOVA on block-level metrics
+# ============================
+print("Running mixed models on block-level metrics...")
+block_df["Day"] = block_df["Day"].astype(str)
+block_df["Bloque_num"] = block_df["Bloque"].astype(int)
+
+for dv in ["Lick_Rate", "ILI_mean", "Burst_Count"]:
+    sub = block_df.dropna(subset=[dv])
+    if sub.empty:
+        print(f"No data for {dv}, skipping mixed model.")
+        continue
+    try:
+        import patsy
+        formula = f"{dv} ~ Bloque_num * Sexo * Tratamiento * Day"
+        y, X = patsy.dmatrices(formula, data=sub, return_type='dataframe')
+        model = MixedLM(endog=y, exog=X, groups=sub["Archivo"]).fit(reml=False)
+        with open(output_folder / "tables" / f"MixedLM_block_{dv}.txt", "w") as fh:
+            fh.write(model.summary().as_text())
+        print(f"MixedLM saved for {dv}")
+    except Exception as e:
+        print(f"MixedLM failed for {dv}: {e}")
+
+# factorial ANOVA on block-level collapsed across animals
+for dv in ["Lick_Rate", "ILI_mean", "Burst_Count"]:
+    sub = block_df.dropna(subset=[dv])
+    if sub.empty:
+        continue
+    try:
+        model = ols(f"{dv} ~ C(Sexo) * C(Tratamiento) * C(Day) * C(Bloque)", data=sub).fit()
+        anova_table = sm.stats.anova_lm(model, typ=2)
+        anova_table.to_csv(output_folder / "tables" / f"ANOVA_blocklevel_{dv}.csv")
+    except Exception as e:
+        print(f"ANOVA block-level failed for {dv}: {e}")
+
+# regression slopes per group-day
+print("Computing regression slopes...")
+slopes = []
+for (sx, tr, dy), sub in block_df.groupby(["Sexo", "Tratamiento", "Day"]):
+    sub = sub.dropna(subset=["Lick_Rate", "Bloque_num"])
+    if len(sub) < 2:
+        continue
+    X = sm.add_constant(sub["Bloque_num"])
+    y = sub["Lick_Rate"]
+    res = sm.OLS(y, X).fit()
+    slopes.append({
+        "Sexo": sx, "Tratamiento": tr, "Day": dy,
+        "N": len(sub), "Slope": res.params["Bloque_num"],
+        "pval": res.pvalues["Bloque_num"], "R2": res.rsquared
+    })
+pd.DataFrame(slopes).to_csv(output_folder / "tables" / "regression_slopes_by_group_day.csv", index=False)
+print("Regression slopes saved.")
+
+# ============================
+# ANALYSIS C: PCA & CCA (multivariate relationships)
+# ============================
+print("Running PCA on file-level metrics...")
+# prepare PCA variables: use Licks_ cols + ILI_mean + Burst_Count if present
+pca_cols = [c for c in file_summary_df.columns if str(c).startswith("Licks_")]
+pca_cols += [c for c in ["ILI_mean", "Burst_Count", "Total_Licks"] if c in file_summary_df.columns]
+pca_cols = list(dict.fromkeys(pca_cols))  # preserve order, unique
+
+pca_df = file_summary_df.dropna(subset=["Total_Licks"]).copy()
+# fill small missing values with median to keep samples
+for c in pca_cols:
+    if c in pca_df.columns:
+        pca_df[c] = pca_df[c].fillna(pca_df[c].median())
+
+X = StandardScaler().fit_transform(pca_df[pca_cols])
+_pca = PCA(n_components=2)
+pcs = _pca.fit_transform(X)
+pca_df["PC1"], pca_df["PC2"] = pcs[:, 0], pcs[:, 1]
+
+# plot PCA (centroids per group/day trajectories)
+sns.set(style="whitegrid", context="talk")
+fig, ax = plt.subplots(figsize=(9, 7))
+sns.scatterplot(data=pca_df, x="PC1", y="PC2", hue="Group", palette=group_colors, s=80, ax=ax)
+centroids = pca_df.groupby(["Group", "Day"]).agg({"PC1": "mean", "PC2": "mean"}).reset_index()
+for group in centroids["Group"].unique():
+    gd = centroids[centroids["Group"] == group].sort_values("Day")
+    ax.plot(gd["PC1"], gd["PC2"], marker="o", color=group_colors.get(group, "#333333"), linewidth=2)
+    for _, r in gd.iterrows():
+        ax.text(r["PC1"], r["PC2"], r["Day"], fontsize=9, weight="bold")
+ax.set_title("PCA - file-level (licks + ILI + bursts)")
+ax.set_xlabel(f"PC1 ({_pca.explained_variance_ratio_[0]*100:.1f}% var)")
+ax.set_ylabel(f"PC2 ({_pca.explained_variance_ratio_[1]*100:.1f}% var)")
+ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+plt.tight_layout()
+plt.savefig(output_folder / "figs" / "PCA_filelevel_multivariate.svg", dpi=300)
+plt.close()
+print("PCA saved.")
+
+# CCA: relate licking (Licks_*) to temporal/burst (ILI_mean, Burst_Count)
+print("Running CCA analyses...")
+cca_results = []
+cca_output_folder = output_folder / "cca_plots"
+cca_output_folder.mkdir(exist_ok=True)
+def run_cca_for(sub_df, label_prefix):
+    Xcols = [c for c in sub_df.columns if str(c).startswith("Licks_")]
+    Ycols = [c for c in ["ILI_mean", "Burst_Count", "Burst_Rate_per_min"] if c in sub_df.columns]
+    df = sub_df.dropna(subset=Xcols + Ycols).copy()
+    if len(df) < 3 or len(Ycols) < 1:
+        return None
+    Xs = StandardScaler().fit_transform(df[Xcols])
+    Ys = StandardScaler().fit_transform(df[Ycols])
+    n_comp = min(2, Xs.shape[1], Ys.shape[1])
+    cca = CCA(n_components=n_comp)
+    Xc, Yc = cca.fit_transform(Xs, Ys)
+    corrs = [np.corrcoef(Xc[:, i], Yc[:, i])[0, 1] for i in range(n_comp)]
+    plt.figure(figsize=(6,5))
+    plt.scatter(Xc[:,0], Yc[:,0], alpha=0.7)
+    plt.xlabel("Componente X (licking)")
+    plt.ylabel("Componente Y (temporal/burst)")
+    plt.title(f"CCA - {label_prefix} | r = {corrs[0]:.2f}")
+    plt.grid(True)
+    plt.tight_layout()
+    fname = cca_output_folder / f"CCA_{label_prefix.replace(' ', '_')}.svg"
+    plt.savefig(fname, dpi=300)
+    plt.close()
+    return {"label": label_prefix, "corrs": corrs, "n": len(df)}
+
+# by Sexo
+for sexo, sub in file_summary_df.groupby("Sexo"):
+    r = run_cca_for(sub, f"Sexo_{sexo}")
+    if r:
+        cca_results.append(r)
+# by Tratamiento
+for trat, sub in file_summary_df.groupby("Tratamiento"):
+    r = run_cca_for(sub, f"Trat_{trat}")
+    if r:
+        cca_results.append(r)
+# by Day
+for day, sub in file_summary_df.groupby("Day"):
+    r = run_cca_for(sub, f"Day_{day}")
+    if r:
+        cca_results.append(r)
+
+pd.DataFrame(cca_results).to_csv(output_folder / "tables" / "cca_summary.csv", index=False)
+print("CCA done.")
+
+# save final tables
+file_summary_df.to_csv(output_folder / "tables" / "file_summary_with_metrics.csv", index=False)
+block_df.to_csv(output_folder / "tables" / "block_summary_with_metrics.csv", index=False)
+
+print("All outputs saved in:", output_folder)
+print("Pipeline finished.")
+
+# ===========================================================
+# PCA SEPARADOS POR SEXO (MACHOS Y HEMBRAS)
+# ===========================================================
+
+def run_pca_by_sex(pca_df, pca_cols, sexo_label, outname):
+    sub = pca_df[pca_df["Sexo"] == sexo_label].copy()
+    if len(sub) < 3:
+        print(f"No hay suficientes animales para PCA en sexo = {sexo_label}")
+        return
+
+    # estandarización
+    Xs = StandardScaler().fit_transform(sub[pca_cols])
+
+    pca_sex = PCA(n_components=2)
+    pcs = pca_sex.fit_transform(Xs)
+    sub["PC1"], sub["PC2"] = pcs[:, 0], pcs[:, 1]
+
+    # ========== Plot ==========
+    sns.set(style="whitegrid", context="talk")
+    fig, ax = plt.subplots(figsize=(9, 7))
+
+    sns.scatterplot(
+        data=sub, x="PC1", y="PC2",
+        hue="Tratamiento", style="Day",
+        palette=palette_treatment, s=90, ax=ax
+    )
+
+    ax.set_title(f"PCA — Sexo {sexo_label}")
+    ax.set_xlabel(f"PC1 ({pca_sex.explained_variance_ratio_[0]*100:.1f}% var)")
+    ax.set_ylabel(f"PC2 ({pca_sex.explained_variance_ratio_[1]*100:.1f}% var)")
+
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    plt.tight_layout()
+    plt.savefig(output_folder / "figs" / outname, dpi=300)
+    plt.close()
+
+    print(f"PCA guardado para sexo = {sexo_label}")
+
+
+# Ejecutar PCA para cada sexo
+run_pca_by_sex(pca_df, pca_cols, "M", "PCA_filelevel_MACHOS.svg")
+run_pca_by_sex(pca_df, pca_cols, "F", "PCA_filelevel_HEMBRAS.svg")
+
+
+# ===============================================================
+# HEATMAP DE R² POR SEXO × TRATAMIENTO × DÍA
+# ===============================================================
+
+import seaborn as sns
+import statsmodels.api as sm
+import numpy as np
+import matplotlib.pyplot as plt
+
+df_heat = file_summary_df  # ESTE ES EL CORRECTO
+
+r2_results = []
+
+for sexo in df_heat["Sexo"].unique():
+    for trat in df_heat["Tratamiento"].unique():
+        for dia in sorted(df_heat["Day"].unique()):
+
+            sub = df_heat[
+                (df_heat["Sexo"] == sexo) &
+                (df_heat["Tratamiento"] == trat) &
+                (df_heat["Day"] == dia)
+            ]
+
+            # se necesitan al menos 3 animales para una regresión estable
+            if len(sub) > 2:
+                X = sm.add_constant(sub["Total_Licks"])
+                y = sub["Lick_Rate"]
+                res = sm.OLS(y, X).fit()
+                r2_value = res.rsquared
+            else:
+                r2_value = np.nan  # insuficientes datos
+
+            r2_results.append({
+                "Sexo": sexo,
+                "Tratamiento": trat,
+                "Day": dia,
+                "R2": r2_value
+            })
+
+r2_df = pd.DataFrame(r2_results)
+
+# ===============================================================
+# PIVOT TABLE PARA HEATMAP
+# ===============================================================
+
+heatmap_df = r2_df.pivot_table(
+    index="Sexo",
+    columns=["Tratamiento", "Day"],
+    values="R2"
+)
+
+plt.figure(figsize=(14, 6))
+sns.heatmap(heatmap_df, annot=True, fmt=".2f", cmap="viridis", vmin=0, vmax=1)
+plt.title("R² por Sexo × Tratamiento × Día")
+plt.tight_layout()
+plt.savefig(output_folder / "figs" / "HeatMap.svg", dpi=300)
+plt.show()# -------------------------
+# PCA por Tratamiento + Permutation test Mahalanobis (D1 vs otros)
+# -------------------------
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+# ----- parámetros de la prueba de permutación -----
+N_PERMS = 5000  # puedes bajar a 2000 si quieres más rapidez
+RANDOM_STATE = 42
+rng = np.random.default_rng(RANDOM_STATE)
+
+# asegúrate de que pca_cols está definido como arriba
+# pca_cols = [...]
+assert len(pca_cols) > 0, "pca_cols vacío. Revisa que se definió previamente."
+
+# función Mahalanobis centroid distance
+def mahalanobis_centroid_sq(df, cols, groupA_mask, groupB_mask):
+    """Devuelve D^2 = (meanA - meanB)' * inv(S_pooled) * (meanA - meanB)"""
+    A = df.loc[groupA_mask, cols].values
+    B = df.loc[groupB_mask, cols].values
+    if A.shape[0] < 2 or B.shape[0] < 2:
+        return np.nan
+    meanA = A.mean(axis=0)
+    meanB = B.mean(axis=0)
+    pooled = np.vstack([A - meanA, B - meanB])
+    # pooled covariance (unbiased)
+    cov = np.cov(pooled, rowvar=False)
+    # regularize / pseudo-inverse si singular
+    try:
+        invcov = np.linalg.inv(cov)
+    except np.linalg.LinAlgError:
+        invcov = np.linalg.pinv(cov)
+    diff = meanA - meanB
+    d2 = float(diff.T.dot(invcov).dot(diff))
+    return d2
+
+def permutation_test_centroid_distance(df, cols, group_col, groupA, groupB, n_perm=N_PERMS):
+    """Permutation test for Mahalanobis D^2 between groupA and groupB (labels in group_col)."""
+    maskA = df[group_col] == groupA
+    maskB = df[group_col] == groupB
+    df_sub = df.loc[maskA | maskB, cols + [group_col]].copy()
+    if df_sub[group_col].nunique() != 2:
+        return {"observed": np.nan, "pval": np.nan, "n": len(df_sub)}
+    observed = mahalanobis_centroid_sq(df_sub, cols, df_sub[group_col] == groupA, df_sub[group_col] == groupB)
+    if np.isnan(observed):
+        return {"observed": np.nan, "pval": np.nan, "n": len(df_sub)}
+    count = 0
+    # convert labels to array for faster shuffling
+    labels = df_sub[group_col].values.copy()
+    values = df_sub[cols].values
+    n = len(labels)
+    for i in range(n_perm):
+        rng.shuffle(labels)
+        # recompute centroids with permuted labels
+        maskA_p = labels == groupA
+        maskB_p = labels == groupB
+        # need at least 2 in each permuted group to compute cov
+        if maskA_p.sum() < 2 or maskB_p.sum() < 2:
+            continue
+        meanA = values[maskA_p].mean(axis=0)
+        meanB = values[maskB_p].mean(axis=0)
+        pooled = np.vstack([values[maskA_p] - meanA, values[maskB_p] - meanB])
+        cov = np.cov(pooled, rowvar=False)
+        try:
+            invcov = np.linalg.inv(cov)
+        except np.linalg.LinAlgError:
+            invcov = np.linalg.pinv(cov)
+        diff = meanA - meanB
+        d2_perm = float(diff.T.dot(invcov).dot(diff))
+        if d2_perm >= observed - 1e-12:
+            count += 1
+    # p-value (one-sided, proportion of perms >= observed)
+    pval = (count + 1) / (n_perm + 1)
+    return {"observed": observed, "pval": pval, "n": n}
+
+# ---- 1) PCA separado por Tratamiento (y guardado) ----
+for trat in file_summary_df["Tratamiento"].unique():
+    sub = file_summary_df[file_summary_df["Tratamiento"] == trat].copy()
+    if sub.empty:
+        continue
+    X_sub = sub[pca_cols].fillna(sub[pca_cols].median()).values
+    Xs = StandardScaler().fit_transform(X_sub)
+    pca_local = PCA(n_components=2, random_state=RANDOM_STATE)
+    pcs_local = pca_local.fit_transform(Xs)
+    sub["PC1"], sub["PC2"] = pcs_local[:,0], pcs_local[:,1]
+
+    plt.figure(figsize=(7,6))
+    sns.scatterplot(data=sub, x="PC1", y="PC2", hue="Day", palette="viridis", s=80)
+    cent = sub.groupby("Day").agg({"PC1":"mean","PC2":"mean"}).reset_index()
+    for _, r in cent.iterrows():
+        plt.text(r["PC1"], r["PC2"], r["Day"], fontsize=9, weight="bold")
+    plt.title(f"PCA - Tratamiento: {trat}")
+    plt.xlabel(f"PC1 ({pca_local.explained_variance_ratio_[0]*100:.1f}% var)")
+    plt.ylabel(f"PC2 ({pca_local.explained_variance_ratio_[1]*100:.1f}% var)")
+    plt.tight_layout()
+    plt.savefig(output_folder / "figs" / f"PCA_by_Treatment_{trat}.svg", dpi=300)
+    plt.close()
+
+# ---- 2) Pruebas de permutación Mahalanobis ----
+# comparaciones de interés:
+comparisons = [
+    ("D1", "D2"),                # D1 vs D2
+    ("D1", "D3"),                # D1 vs D3
+    ("D1", "D4"),
+    ("D1", "D5"),
+    ("D1", "D6"),
+    ("D1", "D2_D6_all")          # D1 vs D2..D6 (merge)
+]
+
+results = []
+# helper for D1 vs D2..D6 combined
+file_summary_df["_Day_group"] = file_summary_df["Day"]
+mask_post = file_summary_df["Day"].isin(["D2","D3","D4","D5","D6"])
+file_summary_df.loc[mask_post, "_Day_group"] = "D2_D6"
+
+for comp in comparisons:
+    a, b = comp
+    if b == "D2_D6_all":
+        res = permutation_test_centroid_distance(file_summary_df, pca_cols, "_Day_group", "D1", "D2_D6", n_perm=N_PERMS)
+        results.append({"comp": "D1_vs_D2-6", **res})
+    else:
+        res = permutation_test_centroid_distance(file_summary_df, pca_cols, "Day", a, b, n_perm=N_PERMS)
+        results.append({"comp": f"{a}_vs_{b}", **res})
+
+# además: tests por Tratamiento (D1 vs D2-6 dentro de cada tratamiento)
+for trat in file_summary_df["Tratamiento"].unique():
+    sub = file_summary_df[file_summary_df["Tratamiento"] == trat].copy()
+    if sub.empty:
+        continue
+    sub["_Day_group"] = sub["Day"].where(~sub["Day"].isin(["D2","D3","D4","D5","D6"]), "D2_D6")
+    res = permutation_test_centroid_distance(sub, pca_cols, "_Day_group", "D1", "D2_D6", n_perm=N_PERMS)
+    results.append({"comp": f"D1_vs_D2-6_{trat}", **res})
+
+# save results
+res_df = pd.DataFrame(results)
+res_df.to_csv(output_folder / "tables" / "permutation_mahalanobis_D1_vs_others.csv", index=False)
+print("Permutation Mahalanobis tests saved.")
+print(res_df)
