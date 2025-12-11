@@ -1,0 +1,271 @@
+# This script loads CSV files from a six-day licking experiment, computes preference ratios for different solutions per group, and generates day-wise plots with individual points and mean ± SEM. 
+# saving both the combined data (MASTER_PREFERENCE_6days.csv) and SVG figures
+import os
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# User-provided config (unchanged)
+# ----------------------------
+liquid_palette = {
+    'Sugar':      "#E6399B",
+    'Sugar2':     "#F48CBF",
+    'Water':      "#1B3C9B",
+    'Water2':     "#00A8CC",
+    'Fructose2':  "#4B0082",
+    'Fructose':   "#B57EDC",
+    'Saccharin2': "#23510D",
+    'Saccharin':  "#76C203"
+}
+
+# groups: patterns in filename (we will search for these substrings)
+group_patterns = {
+    "CONTROL_F": "_CONTROL_F",
+    "EXPERIMENTAL_F": "_EXPERIMENTAL_F",
+    "CONTROL_M": "_CONTROL_M",
+    "EXPERIMENTAL_M": "_EXPERIMENTAL_M"
+}
+
+# Day-to-solution map (your exact map)
+day_solution_map_list = [
+    {1: "Water",     2: "Water2"},   # index 0 -> D1
+    {1: "Sugar",     2: "Sugar2"},   # D2
+    {1: "Water",     2: "Sugar"},    # D3
+    {1: "Sugar",     2: "Water"},    # D4
+    {1: "Fructose",  2: "Sugar"},    # D5
+    {1: "Sugar",     2: "Saccharin"} # D6
+]
+
+folders = [
+    "Licking_Paper_D1",
+    "Licking_Paper_D2",
+    "Licking_Paper",
+    "Licking_Paper_D4",
+    "Licking_Paper_D5",
+    "Licking_Paper_D6"
+]
+
+day_labels = ["D1", "D2", "D3", "D4", "D5", "D6"]
+
+# preferred solution per day (numerator for ratio)
+preferred_solution = {
+    "D1": "Water",
+    "D2": "Sugar",
+    "D3": "Sugar",
+    "D4": "Sugar",
+    "D5": "Sugar",
+    "D6": "Sugar"
+}
+
+# plotting styles
+sex_markers = {"F": "o", "M": "s"}             # F -> circle, M -> square
+condition_fill = {"CONTROL": "white", "EXPERIMENTAL": "black"}
+groups_order = ["CONTROL_F", "EXPERIMENTAL_F", "CONTROL_M", "EXPERIMENTAL_M"]
+
+top_fill = "#F5D6D6"
+bot_fill = "#D6E3F5"
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def detect_group(filename):
+    name = filename.upper()
+    for key, pat in group_patterns.items():
+        if pat.upper() in name:
+            return key
+    # fallback heuristics
+    if "CONTROL" in name and ("_F" in name or " F" in name):
+        return "CONTROL_F"
+    if "CONTROL" in name and ("_M" in name or " M" in name):
+        return "CONTROL_M"
+    if "EXPERIMENTAL" in name and ("_F" in name or " F" in name):
+        return "EXPERIMENTAL_F"
+    if "EXPERIMENTAL" in name and ("_M" in name or " M" in name):
+        return "EXPERIMENTAL_M"
+    return "UNKNOWN"
+
+def read_csv_try(path):
+    # try skiprows 17..19, choose first that gives >=3 cols
+    for skip in (17, 18, 19, 0):
+        try:
+            df = pd.read_csv(path, skiprows=skip)
+            if df.shape[1] >= 3:
+                return df
+        except Exception:
+            continue
+    # final raw read attempt
+    return pd.read_csv(path, error_bad_lines=False, warn_bad_lines=False)
+
+def rename_first3(df, sol_map):
+    cols = list(df.columns)
+    rename_map = {}
+    if len(cols) >= 1:
+        rename_map[cols[0]] = "Time"
+    if len(cols) >= 2:
+        rename_map[cols[1]] = sol_map[1]
+    if len(cols) >= 3:
+        rename_map[cols[2]] = sol_map[2]
+    df = df.rename(columns=rename_map)
+    # ensure the two solution columns exist
+    for s in sol_map.values():
+        if s not in df.columns:
+            df[s] = 0
+    # coerce numeric
+    for s in sol_map.values():
+        df[s] = pd.to_numeric(df[s], errors="coerce").fillna(0)
+    return df
+
+# ----------------------------
+# Main loop: load files, compute totals and ratio
+# ----------------------------
+root = Path("Licking_Paper")  # expects Licking_Paper/Licking_Paper_D1 etc.
+master_rows = []
+
+for idx, folder in enumerate(folders):           # idx 0..5
+    day_label = day_labels[idx]
+    sol_map = day_solution_map_list[idx]
+    sol1 = sol_map[1]; sol2 = sol_map[2]
+    pref_sol = preferred_solution[day_label]
+
+    folder_path = Path(folder)
+    if not folder_path.exists():
+        # try inside root folder if user provided 'Licking_Paper' parent
+        alt = root / folder
+        if alt.exists():
+            folder_path = alt
+        else:
+            # try searching for any folder that contains the folder string
+            matches = [p for p in root.glob("*") if folder in p.name]
+            folder_path = matches[0] if matches else None
+
+    if folder_path is None or not folder_path.exists():
+        print(f"⚠️ Folder not found for {day_label}: tried '{folder}' and '{root / folder}'. Skipping.")
+        continue
+
+    csv_files = sorted([p for p in folder_path.glob("*.csv")])
+    if not csv_files:
+        print(f"⚠️ No CSV files found in {folder_path} for {day_label}.")
+        continue
+
+    for f in csv_files:
+        try:
+            df_raw = read_csv_try(f)
+            df = rename_first3(df_raw, sol_map)
+        except Exception as e:
+            print(f"⛔ Could not read {f.name}: {e}")
+            continue
+
+        # totals
+        l1 = df[sol1].sum()
+        l2 = df[sol2].sum()
+        total = l1 + l2
+        if total == 0:
+            ratio = float("nan")
+        else:
+            # numerator determined by preferred_solution
+            if pref_sol == sol1:
+                ratio = l1 / total
+            elif pref_sol == sol2:
+                ratio = l2 / total
+            else:
+                # fallback detect sugar substring
+                if "SUGAR" in sol1.upper():
+                    ratio = l1 / total
+                elif "SUGAR" in sol2.upper():
+                    ratio = l2 / total
+                else:
+                    ratio = l1 / total
+
+        group_key = detect_group(f.name)
+        sex = "F" if group_key.endswith("_F") else ("M" if group_key.endswith("_M") else None)
+        condition = "CONTROL" if "CONTROL" in group_key else ("EXPERIMENTAL" if "EXPERIMENTAL" in group_key else None)
+
+        master_rows.append({
+            "Archivo": f.name,
+            "GroupKey": group_key,
+            "Sex": sex,
+            "Condition": condition,
+            "Day": day_label,
+            "Sol1": sol1,
+            "Sol2": sol2,
+            "Licks_Sol1": l1,
+            "Licks_Sol2": l2,
+            "Preference_Ratio": ratio
+        })
+
+# create dataframe
+df_pref = pd.DataFrame(master_rows)
+if df_pref.empty:
+    raise SystemExit("❌ No data loaded — check file locations and names.")
+
+# save master file
+out = Path("MASTER_PREFERENCE_6days.csv")
+df_pref.to_csv(out, index=False)
+print("Master saved to:", out)
+
+# ----------------------------
+# Plot: one figure per day
+# ----------------------------
+import matplotlib
+for day_label in day_labels:
+    df_day = df_pref[df_pref["Day"] == day_label]
+    if df_day.empty:
+        print("Skipping", day_label, "— no rows.")
+        continue
+
+    fig, ax = plt.subplots(figsize=(6,5))   # ← AQUI FALTABA
+
+
+    # GET DAY COLORS FROM PALETTE
+    sol_map = day_solution_map_list[day_labels.index(day_label)]
+    col_top = liquid_palette[sol_map[1]]
+    col_bottom = liquid_palette[sol_map[2]]
+
+    # background colored by the two solutions of that day
+    ax.axhspan(0.5, 1.0, color=col_top, alpha=0.25, zorder=0)
+    ax.axhspan(0.0, 0.5, color=col_bottom, alpha=0.25, zorder=0)
+
+    ax.axhline(0.5, linestyle="--", color="black", linewidth=1, zorder=2)
+
+    ax.axhline(0.5, linestyle="--", color="black", linewidth=1, zorder=2)
+
+    x_positions = np.arange(len(groups_order))
+    for i, group in enumerate(groups_order):
+        sub = df_day[df_day["GroupKey"] == group]
+        if sub.empty:
+            continue
+
+        # individual points
+        for _, row in sub.iterrows():
+            sex = row["Sex"] if pd.notnull(row["Sex"]) else "F"
+            marker = sex_markers.get(sex, "o")
+            cond = row["Condition"] if pd.notnull(row["Condition"]) else "CONTROL"
+            face = condition_fill.get(cond, "white")
+
+            xjit = i + np.random.normal(0, 0.08)
+            ax.scatter(xjit, row["Preference_Ratio"],
+                       marker=marker, edgecolor="black", facecolor=face,
+                       s=90, linewidth=1.2, zorder=3)
+
+        # mean ± sem
+        mean = sub["Preference_Ratio"].mean()
+        sem = sub["Preference_Ratio"].sem()
+        if not np.isnan(mean):
+            ax.errorbar(i, mean, yerr=sem, fmt='o',
+                        color='black',
+                        markerfacecolor=condition_fill.get(sub["Condition"].iloc[0],"white"),
+                        markeredgecolor='black', markersize=10, capsize=4, zorder=4)
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(groups_order, rotation=20)
+    ax.set_ylim(0,1)
+    ax.set_ylabel("Preference Ratio")
+    ax.set_title(f"Preference Ratio — {day_label}")
+    plt.tight_layout()
+
+    savepath = Path(f"Preference_{day_label}.svg")
+    fig.savefig(savepath)
+    plt.show()
+    print("Saved plot:", savepath)
