@@ -1,5 +1,6 @@
 # ============================================================
-# FINAL MERGED 6-PANEL Lick FIGURE
+# Licking behavior across six experimental days is shown for control and experimental groups (female vs. male). 
+# Data are summarized in 8‑min blocks, highlighting temporal patterns and differences in licking counts (L1/L2) across solutions, with statistical effects assessed using linear mixed-effects models.
 # ============================================================
 
 import os
