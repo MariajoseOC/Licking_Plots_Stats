@@ -1,7 +1,8 @@
 # ============================================================
-# FINAL MERGED 6-PANEL BURST FIGURE
-# Color code from Script A + Structure/Legend/Titles from Script B
+# Licking bursts across six experimental days are shown for control and experimental groups (female vs. male). 
+# Bursts, defined as sequences of rapid licks, reveal patterns of concentrated licking behavior in response to different solutions, highlighting motivational and reward-related differences.
 # ============================================================
+
 
 import os
 from pathlib import Path
