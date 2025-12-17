@@ -1,0 +1,157 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+# ============================================
+# Load files
+# ============================================
+cons_raw = pd.read_csv("TotalConsumo_alldays.csv")
+lick_raw = pd.read_csv("TotalLicking_alldays.csv")
+
+# Standardize group column
+cons_raw = cons_raw.rename(columns={"Grupo": "Group"})
+lick_raw = lick_raw.rename(columns={"Group": "Group"})
+
+# Remove columns that are completely empty
+cons_raw = cons_raw.dropna(axis=1, how="all")
+lick_raw = lick_raw.dropna(axis=1, how="all")
+
+# ============================================
+# KEEP ONLY REAL DAY COLUMNS
+# columns starting with "Day"
+# ============================================
+def filter_day_columns(df):
+    keep = ["Group", "Rat"]
+    for c in df.columns:
+        if c.strip().startswith("Day"):
+            keep.append(c)
+    return df[keep]
+
+cons_raw = filter_day_columns(cons_raw)
+lick_raw = filter_day_columns(lick_raw)
+
+# ============================================
+# MELT WIDE → LONG FORMAT
+# ============================================
+def melt_behavior(df, value_name):
+    id_vars = ["Group", "Rat"]
+    value_vars = [c for c in df.columns if c not in id_vars]
+
+    melted = df.melt(
+        id_vars=id_vars,
+        value_vars=value_vars,
+        var_name="Column",
+        value_name=value_name
+    )
+
+    # Clean name
+    melted["Column"] = melted["Column"].str.strip()
+
+    # Extract day number
+    melted["Day"] = melted["Column"].str.extract(r"Day\s*([0-9])").astype(float)
+
+    # Drop rows without valid day
+    melted = melted.dropna(subset=["Day"])
+
+    melted["Day"] = melted["Day"].astype(int)
+
+    # Extract solution name
+    melted["Solution"] = melted["Column"].str.extract(r"\((.*?)\)").iloc[:, 0]
+    melted["Solution"] = melted["Solution"].str.replace("Saccharine", "Saccharin")
+
+    # Spout within each day
+    melted["Spout"] = melted.groupby(["Group", "Rat", "Day"]).cumcount() + 1
+
+    return melted
+
+
+df_cons = melt_behavior(cons_raw, "Consumo_ml")
+df_lick = melt_behavior(lick_raw, "Licks")
+
+# ============================================
+# MERGE CONSUMO + LICKING
+# ============================================
+df = pd.merge(
+    df_cons,
+    df_lick,
+    on=["Group", "Rat", "Day", "Solution", "Spout"],
+    how="inner"
+)
+
+# ============================================
+# Add Treatment + Sex
+# ============================================
+def split_group(x):
+    if "CONTROL" in x.upper():
+        treatment = "Control"
+    else:
+        treatment = "Experimental"
+
+    if "F" in x.upper():
+        sex = "Female"
+    elif "M" in x.upper():
+        sex = "Male"
+    else:
+        sex = "Unknown"
+
+    return pd.Series([treatment, sex])
+
+df[["Treatment", "Sex"]] = df["Group"].apply(split_group)
+
+
+# ============================================
+# PEARSON PER DAY & GROUP
+# ============================================
+results = []
+
+for day in sorted(df["Day"].unique()):
+    for group in df["Group"].unique():
+        sub = df[(df["Day"] == day) & (df["Group"] == group)]
+        if len(sub) >= 3:
+            r = np.corrcoef(sub["Consumo_ml"], sub["Licks"])[0, 1]
+        else:
+            r = np.nan
+
+        results.append({"Day": day, "Group": group, "Pearson_r": r})
+
+corr_df = pd.DataFrame(results)
+print("\n===== PEARSON CORRELATION =====\n")
+print(corr_df)
+
+# ============================================
+# SCATTERPLOTS
+# ============================================
+solution_palette = {
+    "Water": "#1B3C9B",
+    "Water2": "#00A8CC",
+    "Sugar": "#E6399B",
+    "Sugar2": "#F48CBF",
+    "Fructose": "#B57EDC",
+    "Saccharin": "#76C203"
+}
+
+plot_folder = Path("Plots_Pearson")
+plot_folder.mkdir(exist_ok=True)
+
+for day in sorted(df["Day"].unique()):
+    sub = df[df["Day"] == day]
+
+    plt.figure(figsize=(8, 6))
+    sns.scatterplot(
+        data=sub,
+        x="Consumo_ml",
+        y="Licks",
+        hue="Solution",
+        palette=solution_palette,
+        style="Group",
+        s=80
+    )
+
+    plt.title(f"Consumo vs Licks — Day {day}")
+    plt.tight_layout()
+    plt.savefig(plot_folder / f"Pearson_Day{day}.png", dpi=300)
+    plt.close()
+
+print("\nPlots saved in:  Plots_Pearson\n")
