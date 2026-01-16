@@ -1,0 +1,122 @@
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ============================
+# GLOBAL FIGURE STYLE (JNeuro)
+# ============================
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Arial'],
+    'font.size': 8,
+    'axes.linewidth': 0.6,
+    'xtick.major.width': 0.6,
+    'ytick.major.width': 0.6,
+    'xtick.major.size': 3,
+    'ytick.major.size': 3,
+})
+
+# ============================
+# FOLDER
+# ============================
+folder = "Licking_Paper_D4"
+
+group_patterns = {
+    "CONTROL FEMALE": "_CONTROL_F",
+    "EXPERIMENTAL FEMALE": "_EXPERIMENTAL_F",
+    "CONTROL MALE": "_CONTROL_M",
+    "EXPERIMENTAL MALE": "_EXPERIMENTAL_M"
+}
+
+# ============================
+# COLORS (color-blind safe)
+# ============================
+color_water = '#1E88E5'   # blue
+color_sucrose = '#D81B60' # pink
+
+# ============================
+# LOAD CSVs
+# ============================
+def cargar_csvs_por_grupo(folder, pattern, nombre_grupo):
+    dfs = []
+    for file in os.listdir(folder):
+        if file.endswith('.csv') and pattern in file:
+            df = pd.read_csv(os.path.join(folder, file), skiprows=19)
+            df.columns = ['Time', 'Sugar_Licks', 'Water_Licks']
+            df['Time_sec'] = pd.to_timedelta(df['Time']).dt.total_seconds()
+            df['Grupo'] = nombre_grupo
+            df['Archivo'] = Path(file).stem
+            dfs.append(df)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+# ============================
+# ANALYZE GROUPS
+# ============================
+for nombre_grupo, pattern in group_patterns.items():
+    df = cargar_csvs_por_grupo(folder, pattern, nombre_grupo)
+    if df.empty:
+        print(f"No files found for {nombre_grupo}")
+        continue
+
+    # ============================
+    # SORT BY FIRST SUCROSE LICK
+    # ============================
+    first_lick_times = []
+    for archivo in df['Archivo'].unique():
+        sub_df = df[df['Archivo'] == archivo]
+        first_sugar = sub_df[sub_df['Sugar_Licks'] > 0]['Time_sec'].min()
+        first_lick_times.append((archivo, first_sugar))
+
+    sort_df = (
+        pd.DataFrame(first_lick_times, columns=['Archivo', 'First_Sugar_Lick'])
+        .sort_values('First_Sugar_Lick')
+    )
+    archivos_ordenados = sort_df['Archivo'].tolist()
+
+    # ============================
+    # TWO-PANEL RASTER
+    # ============================
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(6.5, 0.32 * len(archivos_ordenados)),
+        sharey=True
+    )
+
+    # ---- Panel A: Sucrose ----
+    ax = axes[0]
+    for i, archivo in enumerate(archivos_ordenados):
+        sub_df = df[df['Archivo'] == archivo]
+        times = sub_df[sub_df['Sugar_Licks'] > 0]['Time_sec']
+        ax.scatter(times, [i] * len(times),
+                   s=6, marker='|', color=color_sucrose, linewidths=0.6)
+
+    ax.set_title('Sucrose', pad=4)
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Subjects (sorted by first lick)')
+    ax.set_yticks(range(len(archivos_ordenados)))
+    ax.set_yticklabels(archivos_ordenados)
+
+    # ---- Panel B: Water ----
+    ax = axes[1]
+    for i, archivo in enumerate(archivos_ordenados):
+        sub_df = df[df['Archivo'] == archivo]
+        times = sub_df[sub_df['Water_Licks'] > 0]['Time_sec']
+        ax.scatter(times, [i] * len(times),
+                   s=6, marker='|', color=color_water, linewidths=0.6)
+
+    ax.set_title('Water', pad=4)
+    ax.set_xlabel('Time (s)')
+    ax.set_yticks([])
+
+    # ============================
+    # FINAL LAYOUT
+    # ============================
+    fig.suptitle(nombre_grupo, fontsize=9, y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    plt.savefig(
+        f'{nombre_grupo}_raster_sorted_first_sucrose_D4.svg',
+        dpi=300
+    )
+    plt.show()
