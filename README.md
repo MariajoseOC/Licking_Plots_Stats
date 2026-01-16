@@ -1,58 +1,75 @@
-Microstructure of Licking Analysis in Rats
-Sex differences, sugar familiarization, and sweetener generalization
+Licking_Plots_Stats
 
-This repository contains Python scripts and analysis tools used to study the microstructure of licking behavior in adult male and female rats exposed to sucrose, fructose, saccharin, and water. The project quantifies motivational and appetitive components of ingestion using high-resolution licking data.
+This repository contains the Python scripts used for behavioral analysis, licking microstructure quantification, statistical testing, and figure generation for the manuscript on sugar preference and consummatory behavior in rats.
 
-📌 Summary of the Study
+🧪 Overview
 
-Previous research shows that rats highly familiarized with sugar display:
+This project provides the full analysis pipeline for:
 
-delayed acquisition of taste aversion
+preprocessing raw lickometer data
 
-rapid extinction of aversive memory
+computing preference ratios
 
-difficulty associating negative consequences with sugar
+parsing licking microstructure (bursts, inter-lick intervals)
 
-compulsive patterns of intake
+performing statistical analyses (ANOVA, Kruskal–Wallis, post hoc tests)
 
-However, total intake alone does not capture differences between familiarized vs. non-familiarized rats.
+generating all figures presented in the manuscript
 
-This project analyzes licking microstructure, focusing on:
+📦 Repository Contents
 
-burst duration
+data/ (if included) – raw and/or processed data files
 
-cluster size
+scripts/ – Python scripts for analysis and plotting
 
-inter-burst interval (IBI)
+results/ – output figures and summary tables
 
-total licks per 8-minute block
+notebooks/ (optional) – Jupyter notebooks illustrating step-by-step analysis
 
-sex differences
+requirements.txt – Python package dependencies
 
-effects of sugar familiarization
+🚀 Getting Started
+1. Clone the repository
+git clone https://github.com/MariajoseOC/Licking_Plots_Stats.git
+cd Licking_Plots_Stats
 
-Main Findings
+2. Install dependencies
 
-Clear sex-dependent effects, with females showing stronger alterations.
+Install required Python packages:
 
-Preference generalizes not only to sucrose, but to fructose and saccharin as well.
+pip install -r requirements.txt
 
-Sucrose induces more reinforcing behavior than fructose, reflected by shorter IBI.
 
-Experimental intervention alters intra-burst satiety (cluster size) in males.
+(Typical packages include numpy, pandas, matplotlib, scipy, etc.)
 
-IBI remains a robust metric distinguishing sucrose vs. fructose across groups.
+🖥 Running Analyses
 
-These results highlight how early and prolonged exposure to sugar or sweeteners may affect:
+Scripts are structured so that:
 
-satiety
+preprocess_data.py – loads and formats raw lick data
 
-motivation
+microstructure_analysis.py – computes bursts and ILI features
 
-learning
+stats.py – performs statistical tests
 
-dopaminergic circuitry
+plot_figures.py – generates plots for manuscript figures
 
-compulsive intake
+Each script includes comments and function docstrings explaining inputs and outputs.
 
-risk of metabolic and cognitive disorders
+📄 Usage Example
+python preprocess_data.py --input data/raw/ --output data/processed/
+python microstructure_analysis.py --data data/processed/ --out results/microstructure/
+python stats.py --data data/processed/ --out results/stats/
+python plot_figures.py --results results/
+
+📌 Notes / Definitions
+
+Bursts: sequences of licks where ILIs < 250 ms, separated by ILIs > 500 ms
+
+Session length: 30 min two-bottle choice
+
+Groups: Control vs Experimental (14-day sucrose exposure) × Sex
+
+💾 Data Availability
+
+Raw data used to generate the results in the manuscript are available from the corresponding author upon request.
