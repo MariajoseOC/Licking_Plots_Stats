@@ -1,0 +1,282 @@
+# ========================================================================
+# First switch
+# ========================================================================
+
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+folders = [
+    "Licking_Paper_D1",
+    "Licking_Paper_D2",
+    "Licking_Paper",      # D3
+    "Licking_Paper_D4",
+    "Licking_Paper_D5",
+    "Licking_Paper_D6"
+]
+days_labels = ["D1 Water vs Water","D2 Sugar vs Sugar","D3 Water vs Sugar","D4 Water vs Sugar","D5 Sugar vs Fructose","D6 Sugar vs Saccharine"]
+
+GROUP_ORDER = ["CF","EF","CM","EM"]
+group_patterns = {
+    "CF": "CONTROL_F",
+    "EF": "EXPERIMENTAL_F",
+    "CM": "CONTROL_M",
+    "EM": "EXPERIMENTAL_M"
+}
+
+output_folder = Path("Plots_alldays")
+output_folder.mkdir(exist_ok=True)
+
+# Nature-style palette mapping
+palette_NPG = {
+    "CF": "#4C72B0",
+    "EF": "#DA8BC3",
+    "CM": "#8C8C8C",
+    "EM": "#8172B2"
+}
+
+# solution maps per day (kept for loader)
+day_solution_map_list = [
+    {1: "Water",    2: "Water2"},
+    {1: "Sugar",    2: "Sugar2"},
+    {1: "Water",    2: "Sugar"},
+    {1: "Sugar",    2: "Water"},
+    {1: "Fructose", 2: "Sugar"},
+    {1: "Sugar",    2: "Saccharin"}
+]
+
+all_possible_solutions = [
+    "Water","Water2","Sugar","Sugar2",
+    "Fructose","Fructose2",
+    "Saccharin","Saccharin2"
+]
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+def load_day_csv(path, sol_map):
+    """Robust loader: try skiprows common values then fallback."""
+    for skip in (17,18,19,0):
+        try:
+            df = pd.read_csv(path, skiprows=skip)
+            if df.shape[1] >= 3:
+                break
+        except Exception:
+            df = None
+            continue
+    if df is None:
+        df = pd.read_csv(path)
+
+    # rename first three columns
+    cols = list(df.columns)
+    rename_map = {}
+    if len(cols) >= 1: rename_map[cols[0]] = "Time"
+    if len(cols) >= 2: rename_map[cols[1]] = sol_map[1]
+    if len(cols) >= 3: rename_map[cols[2]] = sol_map[2]
+    df = df.rename(columns=rename_map)
+
+    # ensure solution columns exist and numeric
+    for sol in all_possible_solutions:
+        if sol not in df.columns:
+            df[sol] = 0
+        df[sol] = pd.to_numeric(df[sol], errors="coerce").fillna(0)
+
+    # parse time (fallback to row index if parse fails)
+    try:
+        df["Time_sec"] = pd.to_timedelta(df["Time"]).dt.total_seconds()
+        if df["Time_sec"].isnull().all():
+            raise ValueError("time parse produced NaNs")
+    except Exception:
+        try:
+            df["Time_sec"] = pd.to_numeric(df["Time"], errors="coerce")
+            if df["Time_sec"].isnull().all():
+                df["Time_sec"] = np.arange(len(df))
+        except Exception:
+            df["Time_sec"] = np.arange(len(df))
+
+    return df
+
+def identify_group(filename_stem):
+    up = filename_stem.upper()
+    for short, pat in group_patterns.items():
+        if pat in up:
+            return short
+    # fallback best-effort
+    if "CONTROL" in up and ("_F" in up or " F" in up):
+        return "CF"
+    if "CONTROL" in up and ("_M" in up or " M" in up):
+        return "CM"
+    if "EXPERIMENTAL" in up and ("_F" in up or " F" in up):
+        return "EF"
+    if "EXPERIMENTAL" in up and ("_M" in up or " M" in up):
+        return "EM"
+    return "UNK"
+
+def map_sex_treatment(group_short):
+    if group_short == "CF": return "Female", "Control"
+    if group_short == "EF": return "Female", "Experimental"
+    if group_short == "CM": return "Male",   "Control"
+    if group_short == "EM": return "Male",   "Experimental"
+    return np.nan, np.nan
+
+# ----------------------------
+# EXTRACT FIRST SWITCH FOR ALL DAYS
+# ----------------------------
+all_first_switches = []
+
+for folder, day_label, sol_map in zip(folders, days_labels, day_solution_map_list):
+    folder_path = Path(folder)
+    if not folder_path.exists():
+        print(f"⚠️ Missing folder {folder} — skipping {day_label}")
+        continue
+
+    for file in sorted(os.listdir(folder_path)):
+        if not file.lower().endswith(".csv"):
+            continue
+        path = folder_path / file
+        try:
+            df = load_day_csv(path, sol_map)
+        except Exception as e:
+            print(f"Could not read {path}: {e}")
+            continue
+
+        rat = Path(file).stem
+        group = identify_group(rat)
+        sol1, sol2 = sol_map[1], sol_map[2]
+
+        first1 = df.loc[df[sol1] > 0, "Time_sec"].min()
+        first2 = df.loc[df[sol2] > 0, "Time_sec"].min()
+
+        if pd.isna(first1) and pd.isna(first2):
+            continue
+
+        if pd.isna(first1):
+            first_sol, second_sol, first_time = sol2, sol1, first2
+        elif pd.isna(first2):
+            first_sol, second_sol, first_time = sol1, sol2, first1
+        else:
+            if first1 <= first2:
+                first_sol, second_sol, first_time = sol1, sol2, first1
+            else:
+                first_sol, second_sol, first_time = sol2, sol1, first2
+
+        df_after = df[df["Time_sec"] > first_time]
+        first_switch = df_after.loc[df_after[second_sol] > 0, "Time_sec"].min()
+
+        if pd.notna(first_switch):
+            sex, treat = map_sex_treatment(group)
+            all_first_switches.append({
+                "Rat": rat,
+                "Group": group,
+                "Sex": sex,
+                "Treatment": treat,
+                "Day": day_label,
+                "FirstSwitch_sec": float(first_switch)
+            })
+
+df_first_switch = pd.DataFrame(all_first_switches)
+df_first_switch.to_csv(output_folder / "First_Switch_All_Days.csv", index=False)
+print(f"Saved {len(df_first_switch)} rows to {output_folder/'First_Switch_All_Days.csv'}")
+
+# ----------------------------
+# PLOTTING + STATS
+# ----------------------------
+sns.set(style="whitegrid", context="notebook", font_scale=1.15)
+fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharey=True)
+axes = axes.flatten()
+
+anova_summaries = []
+
+for ax, day_label in zip(axes, days_labels):
+
+    df_day = df_first_switch[df_first_switch["Day"] == day_label].copy()
+    if df_day.empty:
+        ax.set_visible(False)
+        continue
+
+    # ensure categorical ordering
+    df_day["Group"] = pd.Categorical(df_day["Group"], categories=GROUP_ORDER, ordered=True)
+
+    # compute means and sems
+    summary = df_day.groupby("Group", observed=False)["FirstSwitch_sec"].agg(["mean","sem"]).reindex(GROUP_ORDER)
+
+    # ---------- bars (matplotlib) ----------
+    bar_width = 0.6
+    x = np.arange(len(GROUP_ORDER))
+    for i, g in enumerate(GROUP_ORDER):
+        mean = summary.loc[g, "mean"] if pd.notna(summary.loc[g, "mean"]) else np.nan
+        color = palette_NPG.get(g, "#888888")
+        if not np.isnan(mean):
+            ax.bar(i, mean, width=bar_width, color=color, edgecolor="black", zorder=1)
+            sem = summary.loc[g, "sem"]
+            # SEM errorbar
+            ax.errorbar(i, mean, yerr=sem, fmt="none", ecolor="black", capsize=5, linewidth=1.2, zorder=2)
+
+    # ---------- dots (individual animals) ----------
+    jitter = 0.12
+    rng = np.random.default_rng(seed=42)  # reproducible jitter
+    for i, g in enumerate(GROUP_ORDER):
+        vals = df_day.loc[df_day["Group"] == g, "FirstSwitch_sec"].values
+        if len(vals) == 0:
+            continue
+        xs = i + rng.normal(0, jitter, size=len(vals))
+        ax.scatter(xs, vals, s=60, facecolors="white", edgecolors="black", linewidths=0.9, zorder=3)
+
+    # ---------- 2-way ANOVA (Sex × Treatment) ----------
+    # Only perform if there is at least some data and both factors present
+    try:
+        df_stats = df_day.dropna(subset=["FirstSwitch_sec", "Sex", "Treatment"]).copy()
+        if len(df_stats) >= 4 and df_stats["Sex"].nunique() >= 2 and df_stats["Treatment"].nunique() >= 2:
+            model = ols("FirstSwitch_sec ~ C(Sex) * C(Treatment)", data=df_stats).fit()
+            anova_table = sm.stats.anova_lm(model, typ=2)
+            anova_csv = output_folder / f"ANOVA_2way_{day_label}.csv"
+            anova_table.to_csv(anova_csv)
+            # Tukey post-hoc across the 4 groups (CF/EF/CM/EM)
+            tukey = pairwise_tukeyhsd(endog=df_stats["FirstSwitch_sec"], groups=df_stats["Group"], alpha=0.05)
+            tukey_df = pd.DataFrame(data=tukey.summary().data[1:], columns=tukey.summary().data[0])
+            tukey_csv = output_folder / f"Tukey_2way_{day_label}.csv"
+            tukey_df.to_csv(tukey_csv, index=False)
+            anova_summaries.append((day_label, anova_table, tukey_df))
+        else:
+            print(f"Skipping 2-way ANOVA for {day_label}: insufficient groups/samples (n={len(df_stats)})")
+    except Exception as e:
+        print(f"ANOVA/Tukey failed for {day_label}: {e}")
+
+    # aesthetics
+    ax.set_title(day_label, fontsize=13, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(GROUP_ORDER, fontsize=11)
+    ax.set_xlim(-0.6, len(GROUP_ORDER)-0.4)
+    ax.set_ylim(0, max(600, df_first_switch["FirstSwitch_sec"].max() if not df_first_switch["FirstSwitch_sec"].empty else 600))
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+# shared y-label
+axes[0].set_ylabel("Time to First Switch (s)", fontsize=12)
+
+plt.tight_layout()
+out_svg = output_folder / "BarsDots_FirstSwitch_2x3_with_2wayANOVA.svg"
+out_png = output_folder / "BarsDots_FirstSwitch_2x3_with_2wayANOVA.png"
+fig.savefig(out_svg, dpi=300)
+fig.savefig(out_png, dpi=300)
+plt.show()
+
+# Save ANOVA summary text file
+with open(output_folder / "ANOVA_Tukey_Summaries.txt", "w") as fo:
+    for d, atbl, tuk in anova_summaries:
+        fo.write(f"=== {d} ===\n\n")
+        fo.write(atbl.to_string())
+        fo.write("\n\nTukey post-hoc results:\n")
+        fo.write(tuk.to_string(index=False))
+        fo.write("\n\n\n")
+
+print("Saved figures and stats to", output_folder)
